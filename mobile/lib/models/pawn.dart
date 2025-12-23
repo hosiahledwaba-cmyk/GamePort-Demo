@@ -5,23 +5,24 @@ class Pawn {
   final int playerId;
   final Color color;
 
-  /// 0 = In Base
-  /// 1..51 = On Common Path
-  /// 52..56 = Final Home Stretch
-  /// 57 = Home (Goal)
+  // 0 = Base
+  // 1-51 = Main Path
+  // 52-56 = Home Stretch
+  // 57 = Home
   int stepIndex;
 
   Pawn({
     required this.id,
     required this.playerId,
     required this.color,
-    this.stepIndex = 0, // Starts in base
+    this.stepIndex = 0,
   });
 
   bool get isHome => stepIndex == 57;
   bool get inBase => stepIndex == 0;
 
-  // Safe spots are usually stars or colored globe stops
+  // Safe spots relative to stepIndex
+  // Starts (1), Stars (9, 14, 22, 27, 35, 40, 48)
   bool get isSafe =>
       stepIndex == 0 ||
       stepIndex == 1 ||
@@ -32,5 +33,5 @@ class Pawn {
       stepIndex == 35 ||
       stepIndex == 40 ||
       stepIndex == 48 ||
-      isHome;
+      stepIndex > 51; // Home stretch is safe
 }

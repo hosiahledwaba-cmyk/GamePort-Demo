@@ -3,197 +3,280 @@ import 'dart:async';
 import 'dart:math';
 import '../models/player.dart';
 import '../models/pawn.dart';
+import '../utils/path_map.dart';
 
 enum GamePhase { rolling, moving, anim, win }
 
 class GameController extends ChangeNotifier {
-  List<Player> players = [];
+  final List<Player> players = [];
   int currentPlayerIndex = 0;
   int currentDiceValue = 1;
   int consecutiveSixes = 0;
   GamePhase phase = GamePhase.rolling;
 
-  // CRITICAL: The Master Lock
-  bool _isProcessingTurn = false;
+  bool _locked = false;
+  Player? winner;
+
+  /* -------------------- GAME SETUP -------------------- */
 
   void startGame(int playerCount) {
     players.clear();
-    List<Color> colors = [Colors.red, Colors.green, Colors.yellow, Colors.blue];
+    const colors = [Colors.red, Colors.green, Colors.yellow, Colors.blue];
 
-    // Player 0 is Human
     players.add(Player(id: 0, color: colors[0], type: PlayerType.human));
-
-    // Others are AI
     for (int i = 1; i < playerCount; i++) {
       players.add(Player(id: i, color: colors[i], type: PlayerType.ai));
     }
 
     currentPlayerIndex = 0;
+    currentDiceValue = 1;
     consecutiveSixes = 0;
     phase = GamePhase.rolling;
-    _isProcessingTurn = false;
+    winner = null;
+    _locked = false;
+
     notifyListeners();
   }
 
-  void rollDice() async {
-    // 1. Strict Guard Clauses
-    if (phase != GamePhase.rolling) return;
-    if (_isProcessingTurn) return;
+  /* -------------------- DICE ROLL -------------------- */
 
-    // 2. Prevent Human from rolling for AI
-    if (players[currentPlayerIndex].type != PlayerType.human &&
-        players[currentPlayerIndex].type != PlayerType.ai) {
-      // Should not happen, but safe guard
-      return;
-    }
+  Future<void> rollDice() async {
+    if (phase != GamePhase.rolling || _locked) return;
+    _lock();
 
-    _isProcessingTurn = true; // LOCK inputs
-
-    // Animation
+    // Dice animation
     for (int i = 0; i < 6; i++) {
-      currentDiceValue = (DateTime.now().millisecondsSinceEpoch % 6) + 1;
+      currentDiceValue = Random().nextInt(6) + 1;
       notifyListeners();
       await Future.delayed(const Duration(milliseconds: 80));
     }
 
-    // Actual Roll
     currentDiceValue = Random().nextInt(6) + 1;
     notifyListeners();
 
-    // "Three Sixes" Rule
+    // Three sixes rule
     if (currentDiceValue == 6) {
       consecutiveSixes++;
       if (consecutiveSixes >= 3) {
-        await Future.delayed(const Duration(milliseconds: 500));
         consecutiveSixes = 0;
-        _endTurn(); // Punish player
+        await Future.delayed(const Duration(milliseconds: 400));
+        _unlock();
+        _endTurn();
         return;
       }
     } else {
       consecutiveSixes = 0;
     }
 
-    // 3. Evaluation Phase
     phase = GamePhase.moving;
     notifyListeners();
 
-    List<Pawn> movablePawns = players[currentPlayerIndex].pawns
-        .where((p) => _canMoveLogic(p))
-        .toList();
+    final movable = _movablePawns();
 
-    if (movablePawns.isEmpty) {
+    if (movable.isEmpty) {
       await Future.delayed(const Duration(milliseconds: 800));
+      _unlock();
       _endTurn();
-    } else {
-      final currentPlayer = players[currentPlayerIndex];
+      return;
+    }
 
-      if (currentPlayer.type == PlayerType.human) {
-        // Auto-move if only 1 option
-        if (movablePawns.length == 1) {
-          await Future.delayed(const Duration(milliseconds: 200));
-          movePawn(movablePawns.first);
-        } else {
-          // UNLOCK: Wait for player to click a pawn
-          _isProcessingTurn = false;
-        }
-      } else {
-        // AI Turn
-        await Future.delayed(const Duration(milliseconds: 800));
-        _performAiMove(movablePawns);
-      }
+    final player = players[currentPlayerIndex];
+
+    // Unlock strictly for the move selection phase
+    _unlock();
+
+    if (player.type == PlayerType.ai) {
+      await Future.delayed(const Duration(milliseconds: 600));
+      _performAiMove(movable);
     }
   }
 
-  // Separated Logic from Public Check
+  /* -------------------- MOVEMENT -------------------- */
+
+  bool canMove(Pawn pawn) =>
+      phase == GamePhase.moving && !_locked && _canMoveLogic(pawn);
+
   bool _canMoveLogic(Pawn pawn) {
     if (pawn.playerId != players[currentPlayerIndex].id) return false;
-    if (pawn.stepIndex == 0 && currentDiceValue != 6) return false;
+    // Rule: Must roll 6 to enter board
+    if (pawn.stepIndex == 0) return currentDiceValue == 6;
+    // Rule: Exact throw to reach home
     if (pawn.stepIndex + currentDiceValue > 57) return false;
     return true;
   }
 
-  // Public check for UI (Includes Phase checks)
-  bool canMove(Pawn pawn) {
-    if (phase != GamePhase.moving) return false;
-    if (_isProcessingTurn) return false; // Visual helper: Grey out if busy
-    return _canMoveLogic(pawn);
-  }
+  Future<void> movePawn(Pawn pawn) async {
+    if (!canMove(pawn)) return;
+    _lock();
 
-  void movePawn(Pawn pawn) async {
-    // SECURITY CHECK: This stops the spam click glitch
-    if (_isProcessingTurn) return;
-    if (phase != GamePhase.moving) return;
-    if (!_canMoveLogic(pawn)) return;
-
-    // IMMEDIATE LOCK
-    _isProcessingTurn = true;
-    notifyListeners();
-
-    // 1. Update Model
+    // 1. Base Exit (Slide animation)
     if (pawn.stepIndex == 0) {
       pawn.stepIndex = 1;
-    } else {
-      pawn.stepIndex += currentDiceValue;
+      notifyListeners();
+      await Future.delayed(const Duration(milliseconds: 500));
+    }
+    // 2. Path Movement (Hopping animation)
+    else {
+      int steps = currentDiceValue;
+      while (steps-- > 0) {
+        pawn.stepIndex++;
+        notifyListeners();
+        // Wait for hop (matches UI duration)
+        await Future.delayed(const Duration(milliseconds: 200));
+      }
     }
 
-    // 2. Capture Logic
-    _checkCaptures(pawn);
+    // Handle collisions
+    bool captured = _handleCollisions(pawn);
+    if (captured) {
+      notifyListeners();
+      await Future.delayed(const Duration(milliseconds: 400));
+    }
 
-    notifyListeners();
+    // Home reached check
+    if (pawn.stepIndex == 57) {
+      players[currentPlayerIndex].completedPawns++;
+      if (players[currentPlayerIndex].completedPawns == 4) {
+        winner = players[currentPlayerIndex];
+        phase = GamePhase.win;
+        _unlock();
+        notifyListeners();
+        return;
+      }
+    }
 
-    // 3. Animation Delay (Wait for pawn to slide)
-    await Future.delayed(const Duration(milliseconds: 600));
-
-    // 4. Decide Next Step
-    if (currentDiceValue == 6) {
+    // Extra turn conditions (6, Capture, or Home)
+    if (currentDiceValue == 6 || captured || pawn.stepIndex == 57) {
       phase = GamePhase.rolling;
       notifyListeners();
+      _unlock();
 
       if (players[currentPlayerIndex].type == PlayerType.ai) {
-        // AI Chain Roll
         await Future.delayed(const Duration(milliseconds: 500));
-        _isProcessingTurn = false; // Briefly unlock for internal logic
         rollDice();
-      } else {
-        // Human Bonus Turn
-        _isProcessingTurn = false; // Unlock so human can roll again
       }
-    } else {
-      _endTurn();
+      return;
     }
+
+    _unlock();
+    _endTurn();
   }
 
-  void _checkCaptures(Pawn mover) {
-    // Collision logic placeholder
+  /* -------------------- COLLISIONS -------------------- */
+
+  /// Checks for collisions on the physical tile the pawn landed on.
+  /// Modifies game state (sends opponent home) if capture occurs.
+  bool _handleCollisions(Pawn mover) {
+    final moverPos = PathMap.getPixelCoordinates(mover, mover.playerId, 1.0);
+
+    // FIXED: Use PathMap to check physical tile safety.
+    // If the tile is safe, NO CUTTING happens regardless of pawn state.
+    if (PathMap.isSafeSpot(moverPos)) return false;
+
+    bool cut = false;
+
+    for (final player in players) {
+      if (player.id == mover.playerId) continue;
+
+      for (final pawn in player.pawns) {
+        // Ignore pawns in Base or Home or Safe Zone > 51
+        if (pawn.stepIndex == 0 || pawn.stepIndex > 51) continue;
+
+        final otherPos = PathMap.getPixelCoordinates(pawn, player.id, 1.0);
+
+        // Simple distance check for "Same Tile"
+        if ((moverPos - otherPos).distance < 0.01) {
+          pawn.stepIndex = 0; // Send back to base
+          cut = true;
+        }
+      }
+    }
+    return cut;
   }
+
+  /* -------------------- TURN FLOW -------------------- */
 
   void _endTurn() {
+    consecutiveSixes = 0;
     currentPlayerIndex = (currentPlayerIndex + 1) % players.length;
     phase = GamePhase.rolling;
-    consecutiveSixes = 0;
-    _isProcessingTurn = false; // Reset lock
     notifyListeners();
 
     if (players[currentPlayerIndex].type == PlayerType.ai) {
-      _isProcessingTurn = true; // Lock immediately for AI
-      Future.delayed(const Duration(milliseconds: 1000), () {
-        _isProcessingTurn = false; // Temp unlock to allow roll entry
-        rollDice();
-      });
+      Future.delayed(const Duration(milliseconds: 800), rollDice);
     }
   }
+
+  List<Pawn> _movablePawns() =>
+      players[currentPlayerIndex].pawns.where(_canMoveLogic).toList();
+
+  /* -------------------- AI -------------------- */
 
   void _performAiMove(List<Pawn> options) {
-    // Simple AI: Prioritize releasing 6, then furthest
-    Pawn bestPawn = options.last;
-    try {
-      bestPawn = options.firstWhere((p) => p.stepIndex == 0);
-    } catch (e) {
-      bestPawn = options.last;
+    Pawn best = options.first;
+
+    // Priority 1: Capture Opponent
+    for (final pawn in options) {
+      if (_wouldCapture(pawn)) {
+        best = pawn;
+        movePawn(best);
+        return;
+      }
     }
 
-    // We must manually unlock briefly so movePawn accepts the call
-    _isProcessingTurn = false;
-    movePawn(bestPawn);
+    // Priority 2: Enter from base (if rolled 6)
+    try {
+      best = options.firstWhere((p) => p.stepIndex == 0);
+    } catch (e) {
+      // Priority 3: Move pawn closest to home
+      best = options.reduce((a, b) => a.stepIndex > b.stepIndex ? a : b);
+    }
+
+    movePawn(best);
   }
+
+  /// Simulates a move to check if it lands on an opponent
+  /// DOES NOT modify actual game state.
+  bool _wouldCapture(Pawn pawn) {
+    // 1. Calculate Target Index
+    int target = pawn.stepIndex == 0 ? 1 : pawn.stepIndex + currentDiceValue;
+
+    // Safety check
+    if (target > 57) return false;
+
+    // 2. Create a Dummy Pawn to check coordinates
+    final testPawn = Pawn(
+      id: pawn.id,
+      playerId: pawn.playerId,
+      color: pawn.color,
+      stepIndex: target,
+    );
+
+    // 3. Calculate simulated position
+    final testPos = PathMap.getPixelCoordinates(testPawn, pawn.playerId, 1.0);
+
+    // 4. Check if this position is a Safe Spot
+    if (PathMap.isSafeSpot(testPos)) return false;
+
+    // 5. Check against all opponents
+    for (final player in players) {
+      if (player.id == pawn.playerId) continue;
+
+      for (final other in player.pawns) {
+        if (other.stepIndex == 0 || other.stepIndex > 51) continue;
+
+        final otherPos = PathMap.getPixelCoordinates(other, player.id, 1.0);
+
+        if ((testPos - otherPos).distance < 0.01) {
+          return true; // Capture detected
+        }
+      }
+    }
+    return false;
+  }
+
+  /* -------------------- LOCKING -------------------- */
+
+  void _lock() => _locked = true;
+  void _unlock() => _locked = false;
 }
